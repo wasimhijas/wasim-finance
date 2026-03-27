@@ -16,8 +16,14 @@ const DEFAULT_SETTINGS = {
 const DEFAULT_DATA = { income: [], expenses: [], creditCards: [], installments: [], savings: [], investments: [] };
 
 // ─── STORAGE ─────────────────────────────────────────────────────────────────
+// localStorage is the primary store — instant, never fails.
+// Cosmos (/api/storage) is synced in the background for cross-device persistence.
 const API = "/api";
-const load = async (key) => {
+
+const lsGet = (key) => { try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : null; } catch { return null; } };
+const lsSet = (key, val) => { try { localStorage.setItem(key, JSON.stringify(val)); } catch {} };
+
+const cosmosGet = async (key) => {
   try {
     const r = await fetch(`${API}/storage?key=${encodeURIComponent(key)}`);
     if (!r.ok) return null;
@@ -25,10 +31,26 @@ const load = async (key) => {
     return data.value ? JSON.parse(data.value) : null;
   } catch { return null; }
 };
-const save = async (key, val) => {
+const cosmosSet = async (key, val) => {
   try {
     await fetch(`${API}/storage`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key, value: JSON.stringify(val) }) });
   } catch {}
+};
+
+// Load: use localStorage immediately, then reconcile with Cosmos in background
+const load = async (key) => {
+  const local = lsGet(key);
+  // Fire Cosmos fetch in background — if it has newer/existing data, sync it back
+  cosmosGet(key).then(remote => {
+    if (remote !== null) lsSet(key, remote);
+  });
+  return local;
+};
+
+// Save: write to localStorage instantly, then sync to Cosmos
+const save = (key, val) => {
+  lsSet(key, val);
+  cosmosSet(key, val);
 };
 
 // ─── UTILS ───────────────────────────────────────────────────────────────────
@@ -181,13 +203,18 @@ export default function App() {
 
   useEffect(() => {
     (async () => {
-      const s = await load("financeSettings");
-      const d = await load("financeData");
-      const merged = s ? { ...DEFAULT_SETTINGS, ...s } : DEFAULT_SETTINGS;
-      if (s) setSettings(merged);
-      if (d) setData({ ...DEFAULT_DATA, ...d });
-      setSelectedMonth(currentMonth(merged.billingCycleStart));
-      setLoaded(true);
+      try {
+        const s = await load("financeSettings");
+        const d = await load("financeData");
+        const merged = s ? { ...DEFAULT_SETTINGS, ...s } : DEFAULT_SETTINGS;
+        if (s) setSettings(merged);
+        if (d) setData({ ...DEFAULT_DATA, ...d });
+        setSelectedMonth(currentMonth(merged.billingCycleStart));
+      } catch (e) {
+        console.error("Init error:", e);
+      } finally {
+        setLoaded(true);
+      }
     })();
   }, []);
 
@@ -1070,11 +1097,25 @@ export default function App() {
     const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
     const setEdit = (k, v) => setEditForm(f => ({ ...f, [k]: v }));
 
-    const filteredInstallments = myInstallments.filter(inst => {
-      if (filterCC === "all") return true;
-      if (filterCC === "cash") return !inst.ccId;
-      return inst.ccId === filterCC;
-    });
+    const filteredInstallments = myInstallments
+      .filter(inst => {
+        if (filterCC === "all") return true;
+        if (filterCC === "cash") return !inst.ccId;
+        return inst.ccId === filterCC;
+      })
+      .sort((a, b) => {
+        const calcA = emiCalcFromDates(a);
+        const calcB = emiCalcFromDates(b);
+        const doneA = (calcA.isAutoCalc && calcA.installmentsTotal !== null ? calcA.remaining : (a.remaining ?? a.total ?? 0)) <= 0 || (calcA.installmentsLeft !== null && calcA.installmentsLeft <= 0);
+        const doneB = (calcB.isAutoCalc && calcB.installmentsTotal !== null ? calcB.remaining : (b.remaining ?? b.total ?? 0)) <= 0 || (calcB.installmentsLeft !== null && calcB.installmentsLeft <= 0);
+        // Completed go to bottom
+        if (doneA && !doneB) return 1;
+        if (!doneA && doneB) return -1;
+        // Both active — sort by months remaining ascending (least remaining first)
+        const leftA = calcA.installmentsLeft ?? 9999;
+        const leftB = calcB.installmentsLeft ?? 9999;
+        return leftA - leftB;
+      });
 
     const formPreview = (() => {
       if (!form.monthly || !form.startDate) return null;
