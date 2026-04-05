@@ -268,12 +268,19 @@ export default function App() {
   const totalAddlIncome = monthIncome.reduce((s, i) => s + i.amount, 0);
   const carryover = monthIncome.filter(i => i.type === "carryover").reduce((s, i) => s + i.amount, 0);
   const totalIncome = salary + totalAddlIncome;
-  const totalExpenses = allMonthExpenses.reduce((s, e) => s + e.amount, 0);
+
+  // For budget purposes, only count what YOU actually paid — subtract what others owe you
+  const myShareOf = (e) => {
+    if (!e.split || !e.splitWith || e.splitWith.length === 0) return e.amount;
+    const owedByOthers = e.splitWith.reduce((s, p) => s + (+p.amount || 0), 0);
+    return Math.max(0, e.amount - owedByOthers);
+  };
+  const totalExpenses = allMonthExpenses.reduce((s, e) => s + myShareOf(e), 0);
   const myNet = totalIncome - totalExpenses;
 
   const catTotals = {};
   cats.forEach(c => catTotals[c] = 0);
-  allMonthExpenses.forEach(e => { catTotals[e.category] = (catTotals[e.category] || 0) + e.amount; });
+  allMonthExpenses.forEach(e => { catTotals[e.category] = (catTotals[e.category] || 0) + myShareOf(e); });
 
   const overallBudget = +(settings.overallBudget || 0);
   const catBudgetSum = Object.values(budgets).reduce((s, v) => s + (+v || 0), 0);
@@ -767,38 +774,70 @@ export default function App() {
           </div>
         )}
         {(() => {
-          // Build "who owes me" summary from all stored expenses (not just this month)
+          // Only expenses from the selected month, unsettled split entries
           const oweSummary = {};
-          (data.expenses || []).forEach(e => {
+          allMonthExpenses.forEach(e => {
             if (!e.split || !e.splitWith || e.splitWith.length === 0) return;
-            e.splitWith.forEach(p => {
+            // For real stored expenses, use the actual id. For recurring instances use the source id.
+            const sourceId = e.isRecurringInstance ? e.id.replace(`rec_`, "").replace(`_${selectedMonth}`, "") : e.id;
+            const settled = (data.expenses || []).find(x => x.id === sourceId)?.splitSettled || {};
+            e.splitWith.forEach((p, pi) => {
               if (!p.name) return;
               const name = p.name.trim();
-              if (!oweSummary[name]) oweSummary[name] = { total: 0, entries: [] };
-              oweSummary[name].total += +p.amount || 0;
-              oweSummary[name].entries.push({ description: e.description, amount: +p.amount || 0, date: e.date });
+              const settleKey = `${sourceId}_${pi}`;
+              const isSettled = !!settled[pi];
+              if (!oweSummary[name]) oweSummary[name] = { total: 0, settledTotal: 0, entries: [] };
+              oweSummary[name].entries.push({ description: e.description, amount: +p.amount || 0, date: e.date, settleKey, sourceId, pi, isSettled });
+              if (!isSettled) oweSummary[name].total += +p.amount || 0;
+              else oweSummary[name].settledTotal += +p.amount || 0;
             });
           });
-          const people = Object.entries(oweSummary).filter(([, v]) => v.total > 0);
+          const people = Object.entries(oweSummary);
           if (people.length === 0) return null;
+
+          const toggleSettle = (sourceId, pi) => {
+            const expenses = data.expenses.map(x => {
+              if (x.id !== sourceId) return x;
+              const settled = { ...(x.splitSettled || {}) };
+              settled[pi] = !settled[pi];
+              return { ...x, splitSettled: settled };
+            });
+            updData("expenses", expenses);
+          };
+
           return (
             <SectionCard title="🤝 Who Owes Me" style={{ marginTop: 18 }}>
+              <p style={{ color: "#475569", fontSize: 11, fontFamily: "system-ui", margin: "0 0 14px", fontStyle: "italic" }}>
+                Split expenses for {monthLabel(selectedMonth)} only.
+              </p>
               {people.map(([name, info]) => (
-                <div key={name} style={{ marginBottom: 14 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                <div key={name} style={{ marginBottom: 16 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 7 }}>
                     <span style={{ color: "#F1F5F9", fontFamily: "system-ui", fontWeight: 600, fontSize: 14 }}>👤 {name}</span>
-                    <span style={{ color: "#F59E0B", fontFamily: "system-ui", fontWeight: 700, fontSize: 15 }}>{fmt(info.total)}</span>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      {info.settledTotal > 0 && <span style={{ color: "#10B981", fontSize: 12, fontFamily: "system-ui" }}>✓ {fmt(info.settledTotal)} settled</span>}
+                      {info.total > 0 && <span style={{ color: "#F59E0B", fontFamily: "system-ui", fontWeight: 700, fontSize: 14 }}>{fmt(info.total)} pending</span>}
+                      {info.total === 0 && <span style={{ color: "#10B981", fontFamily: "system-ui", fontWeight: 700, fontSize: 13 }}>✓ All settled</span>}
+                    </div>
                   </div>
                   {info.entries.map((en, i) => (
-                    <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "4px 10px", background: "#0F172A", borderRadius: 7, marginBottom: 4 }}>
-                      <span style={{ color: "#64748B", fontSize: 12, fontFamily: "system-ui" }}>{en.description} <span style={{ color: "#334155" }}>· {en.date}</span></span>
-                      <span style={{ color: "#94A3B8", fontSize: 12, fontFamily: "system-ui", fontWeight: 600 }}>{fmt(en.amount)}</span>
+                    <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 10px", background: en.isSettled ? "#10B98110" : "#0F172A", borderRadius: 7, marginBottom: 4, border: en.isSettled ? "1px solid #10B98125" : "none", opacity: en.isSettled ? 0.7 : 1 }}>
+                      <div>
+                        <span style={{ color: en.isSettled ? "#64748B" : "#CBD5E1", fontSize: 12, fontFamily: "system-ui", textDecoration: en.isSettled ? "line-through" : "none" }}>{en.description}</span>
+                        <span style={{ color: "#334155", fontSize: 11, fontFamily: "system-ui", marginLeft: 8 }}>{en.date}</span>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <span style={{ color: en.isSettled ? "#475569" : "#94A3B8", fontSize: 12, fontFamily: "system-ui", fontWeight: 600 }}>{fmt(en.amount)}</span>
+                        <button onClick={() => toggleSettle(en.sourceId, en.pi)} style={{ padding: "3px 10px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 11, fontFamily: "system-ui", fontWeight: 600, background: en.isSettled ? "#10B98120" : "#F59E0B20", color: en.isSettled ? "#10B981" : "#F59E0B" }}>
+                          {en.isSettled ? "✓ Settled" : "Mark Settled"}
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
               ))}
               <div style={{ borderTop: "1px solid #334155", paddingTop: 10, marginTop: 4, display: "flex", justifyContent: "space-between" }}>
-                <span style={{ color: "#64748B", fontSize: 12, fontFamily: "system-ui" }}>Total owed to you</span>
+                <span style={{ color: "#64748B", fontSize: 12, fontFamily: "system-ui" }}>Still owed to you this month</span>
                 <span style={{ color: "#F59E0B", fontFamily: "system-ui", fontWeight: 700, fontSize: 14 }}>{fmt(people.reduce((s, [, v]) => s + v.total, 0))}</span>
               </div>
             </SectionCard>
